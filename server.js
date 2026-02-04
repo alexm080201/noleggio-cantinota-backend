@@ -10,44 +10,60 @@ import jwt from "jsonwebtoken";
 
 const app = express();
 
-// ✅ Segreti/Config da Render Environment
+// ---------------------------------------------------------------
+// ✅ Config da Render Environment
+// ---------------------------------------------------------------
 const SECRET_KEY = process.env.SECRET_KEY || "chiave_super_segretissima";
+const DATABASE_URL = process.env.DATABASE_URL;
+
+// (Facoltativo ma utile per debug su Render)
+if (!DATABASE_URL) {
+  console.error("❌ DATABASE_URL non è impostata nelle Environment Variables di Render");
+}
 
 // ---------------------------------------------------------------
-// ✅ CORS (FIX PRE-FLIGHT)
-// Metti qui l'URL del tuo frontend Render
+// ✅ CORS + Preflight (risolve il 'preflight' rosso nel browser)
 // ---------------------------------------------------------------
-const CORS_ORIGINS = [
+const ALLOWED_ORIGINS = [
   "https://noleggio-cantinota-frontend.onrender.com",
   "http://localhost:5173",
 ];
 
 const corsOptions = {
-  origin: CORS_ORIGINS,
+  origin(origin, callback) {
+    // Permette richieste senza Origin (es. Postman) e quelle della whitelist
+    if (!origin) return callback(null, true);
+    if (ALLOWED_ORIGINS.includes(origin)) return callback(null, true);
+    return callback(new Error(`CORS blocked for origin: ${origin}`));
+  },
   methods: ["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"],
   allowedHeaders: ["Content-Type", "Authorization"],
   credentials: true,
+  optionsSuccessStatus: 204,
 };
 
 app.use(cors(corsOptions));
-// 🔥 Questa riga risolve il "preflight" bloccato dal browser
+// ✅ gestione preflight per tutte le route
 app.options("*", cors(corsOptions));
 
+// ---------------------------------------------------------------
+// Middleware
+// ---------------------------------------------------------------
 app.use(bodyParser.json());
 
 // ---------------------------------------------------------------
-// 🔗 Connessione DB (Neon via DATABASE_URL su Render)
+// 🔗 Connessione DB (Neon)
 // ---------------------------------------------------------------
 const client = new Client({
-  connectionString: process.env.DATABASE_URL,
+  connectionString: DATABASE_URL,
   ssl: { rejectUnauthorized: false },
 });
 
-// ✅ NON bloccare l’avvio del server se il DB è lento
+// ✅ NON bloccare l’avvio del server (così non crasha su Render)
 client
   .connect()
   .then(() => console.log("✅ DB connesso"))
-  .catch((err) => console.error("❌ Errore DB:", err.message));
+  .catch((err) => console.error("❌ Errore connessione DB:", err.message));
 
 // ---------------------------------------------------------------
 // Utilità
@@ -64,7 +80,14 @@ function calcolaTotale(prezzoWeekend, quantita, km) {
 }
 
 // ---------------------------------------------------------------
-// LOGIN (admin con tabella admin username/password in chiaro come da progetto)
+// Healthcheck
+// ---------------------------------------------------------------
+app.get("/", (_req, res) => {
+  res.send("✅ Noleggio Cantinota backend attivo");
+});
+
+// ---------------------------------------------------------------
+// LOGIN (tabella admin con username/password in chiaro)
 // ---------------------------------------------------------------
 app.post("/login", async (req, res) => {
   const { username, password } = req.body || {};
@@ -73,14 +96,17 @@ app.post("/login", async (req, res) => {
       "SELECT id, username FROM admin WHERE username = $1 AND password = $2",
       [username, password]
     );
+
     if (r.rows.length === 0) {
       return res.status(401).json({ message: "Credenziali non valide" });
     }
+
     const token = jwt.sign(
       { id: r.rows[0].id, username: r.rows[0].username },
       SECRET_KEY,
       { expiresIn: "4h" }
     );
+
     res.json({ token });
   } catch (err) {
     console.error("Errore login:", err);
@@ -135,7 +161,10 @@ app.put("/clienti/:id", async (req, res) => {
 app.delete("/clienti/:id", async (req, res) => {
   const { id } = req.params;
   try {
-    const ord = await client.query("SELECT 1 FROM ordini WHERE cliente_id=$1 LIMIT 1", [id]);
+    const ord = await client.query(
+      "SELECT 1 FROM ordini WHERE cliente_id=$1 LIMIT 1",
+      [id]
+    );
     if (ord.rows.length > 0) {
       return res.status(400).json({ message: "Cliente con ordini: non eliminabile" });
     }
@@ -194,7 +223,10 @@ app.put("/materiali/:id", async (req, res) => {
 app.delete("/materiali/:id", async (req, res) => {
   const { id } = req.params;
   try {
-    const ord = await client.query("SELECT 1 FROM ordini WHERE materiale_id=$1 LIMIT 1", [id]);
+    const ord = await client.query(
+      "SELECT 1 FROM ordini WHERE materiale_id=$1 LIMIT 1",
+      [id]
+    );
     if (ord.rows.length > 0) {
       return res.status(400).json({ message: "Materiale usato in ordini: non eliminabile" });
     }
@@ -206,6 +238,7 @@ app.delete("/materiali/:id", async (req, res) => {
   }
 });
 
+// Disponibilità/occupazione per ogni materiale (ordini non ritirati)
 app.get("/materiali/disponibilita", async (_req, res) => {
   try {
     const sql = `
@@ -224,7 +257,9 @@ app.get("/materiali/disponibilita", async (_req, res) => {
     res.json(
       r.rows.map((row) => ({
         ...row,
-        low_stock: Number(row.disponibili) <= Math.max(1, Math.floor(Number(row.stock_totale) * 0.1)),
+        low_stock:
+          Number(row.disponibili) <=
+          Math.max(1, Math.floor(Number(row.stock_totale) * 0.1)),
       }))
     );
   } catch (err) {
@@ -245,10 +280,12 @@ app.post("/ordini", async (req, res) => {
       for (const item of materiali) {
         const { materiale_id, quantita } = item;
 
-        const m = await client.query("SELECT prezzo_weekend FROM materiali WHERE id=$1", [materiale_id]);
+        const m = await client.query("SELECT prezzo_weekend FROM materiali WHERE id=$1", [
+          materiale_id,
+        ]);
         if (m.rows.length === 0) continue;
-        const prezzoWeekend = m.rows[0].prezzo_weekend;
 
+        const prezzoWeekend = m.rows[0].prezzo_weekend;
         const totale = calcolaTotale(prezzoWeekend, quantita, km);
 
         const ins = await client.query(
@@ -263,8 +300,12 @@ app.post("/ordini", async (req, res) => {
       return res.json({ message: "Ordini creati", ordini: creati });
     } else {
       const { materiale_id, quantita } = req.body || {};
-      const m = await client.query("SELECT prezzo_weekend FROM materiali WHERE id=$1", [materiale_id]);
+
+      const m = await client.query("SELECT prezzo_weekend FROM materiali WHERE id=$1", [
+        materiale_id,
+      ]);
       if (m.rows.length === 0) return res.status(400).json({ message: "Materiale non valido" });
+
       const prezzoWeekend = m.rows[0].prezzo_weekend;
       const totale = calcolaTotale(prezzoWeekend, quantita, km);
 
@@ -319,8 +360,11 @@ app.put("/ordini/:id", async (req, res) => {
   const { id } = req.params;
   const { cliente_id, materiale_id, quantita, data_consegna, data_ritiro, km, note } = req.body || {};
   try {
-    const m = await client.query("SELECT prezzo_weekend FROM materiali WHERE id=$1", [materiale_id]);
+    const m = await client.query("SELECT prezzo_weekend FROM materiali WHERE id=$1", [
+      materiale_id,
+    ]);
     if (m.rows.length === 0) return res.status(400).json({ message: "Materiale non valido" });
+
     const prezzoWeekend = m.rows[0].prezzo_weekend;
     const totale = calcolaTotale(prezzoWeekend, quantita, km);
 
@@ -415,15 +459,7 @@ app.get("/statistiche/materiali", async (_req, res) => {
 });
 
 // ---------------------------------------------------------------
-// Healthcheck
-// ---------------------------------------------------------------
-app.get("/", (_req, res) => {
-  res.send("✅ Noleggio Cantinota backend attivo");
-});
-
-// ---------------------------------------------------------------
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`✅ Backend attivo su porta ${PORT}`);
 });
-
