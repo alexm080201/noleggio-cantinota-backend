@@ -8,31 +8,46 @@ import pkg from "pg";
 const { Client } = pkg;
 import jwt from "jsonwebtoken";
 
-// ⚠️ Chiave JWT "semplice" per compatibilità con il progetto attuale.
-// In produzione è consigliato usare un segreto più robusto e password hashate.
-const SECRET_KEY = "chiave_super_segretissima";
-
 const app = express();
 
-// 🔗 Connessione a Neon (usa la tua stringa di connessione)
+// ✅ Segreti/Config da Render Environment
+const SECRET_KEY = process.env.SECRET_KEY || "chiave_super_segretissima";
+
+// ---------------------------------------------------------------
+// ✅ CORS (FIX PRE-FLIGHT)
+// Metti qui l'URL del tuo frontend Render
+// ---------------------------------------------------------------
+const CORS_ORIGINS = [
+  "https://noleggio-cantinota-frontend.onrender.com",
+  "http://localhost:5173",
+];
+
+const corsOptions = {
+  origin: CORS_ORIGINS,
+  methods: ["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"],
+  allowedHeaders: ["Content-Type", "Authorization"],
+  credentials: true,
+};
+
+app.use(cors(corsOptions));
+// 🔥 Questa riga risolve il "preflight" bloccato dal browser
+app.options("*", cors(corsOptions));
+
+app.use(bodyParser.json());
+
+// ---------------------------------------------------------------
+// 🔗 Connessione DB (Neon via DATABASE_URL su Render)
+// ---------------------------------------------------------------
 const client = new Client({
-  connectionString:
-    "postgresql://neondb_owner:npg_JalrUR40VGyb@ep-spring-tooth-agl53mlo-pooler.c-2.eu-central-1.aws.neon.tech/neondb?sslmode=require&channel_binding=require",
+  connectionString: process.env.DATABASE_URL,
   ssl: { rejectUnauthorized: false },
 });
 
-await client.connect();
-
-app.use(cors({
-  origin: [
-    "https://noleggio-cantinota-frontend.onrender.com",
-    "http://localhost:5173"
-  ],
-  methods: ["GET", "POST", "PUT", "DELETE", "PATCH"],
-  credentials: true
-}));
-
-app.use(bodyParser.json());
+// ✅ NON bloccare l’avvio del server se il DB è lento
+client
+  .connect()
+  .then(() => console.log("✅ DB connesso"))
+  .catch((err) => console.error("❌ Errore DB:", err.message));
 
 // ---------------------------------------------------------------
 // Utilità
@@ -122,9 +137,7 @@ app.delete("/clienti/:id", async (req, res) => {
   try {
     const ord = await client.query("SELECT 1 FROM ordini WHERE cliente_id=$1 LIMIT 1", [id]);
     if (ord.rows.length > 0) {
-      return res
-        .status(400)
-        .json({ message: "Cliente con ordini: non eliminabile" });
+      return res.status(400).json({ message: "Cliente con ordini: non eliminabile" });
     }
     await client.query("DELETE FROM clienti WHERE id=$1", [id]);
     res.json({ message: "Cliente eliminato" });
@@ -153,7 +166,6 @@ app.post("/materiali", async (req, res) => {
   const { nome, quantita_disponibile, prezzo_weekend } = req.body || {};
   try {
     const r = await client.query(
-      // Usiamo quantita_disponibile come “stock totale”
       "INSERT INTO materiali (nome, quantita_disponibile, prezzo_weekend) VALUES ($1,$2,$3) RETURNING *",
       [nome, quantita_disponibile, prezzo_weekend]
     );
@@ -184,9 +196,7 @@ app.delete("/materiali/:id", async (req, res) => {
   try {
     const ord = await client.query("SELECT 1 FROM ordini WHERE materiale_id=$1 LIMIT 1", [id]);
     if (ord.rows.length > 0) {
-      return res
-        .status(400)
-        .json({ message: "Materiale usato in ordini: non eliminabile" });
+      return res.status(400).json({ message: "Materiale usato in ordini: non eliminabile" });
     }
     await client.query("DELETE FROM materiali WHERE id=$1", [id]);
     res.json({ message: "Materiale eliminato" });
@@ -196,7 +206,6 @@ app.delete("/materiali/:id", async (req, res) => {
   }
 });
 
-// Disponibilità/occupazione per ogni materiale (ordini non ritirati)
 app.get("/materiali/disponibilita", async (_req, res) => {
   try {
     const sql = `
@@ -226,22 +235,16 @@ app.get("/materiali/disponibilita", async (_req, res) => {
 
 // ---------------------------------------------------------------
 // ORDINI
-// Tabella ordini: id, cliente_id, materiale_id, quantita, data_consegna, data_ritiro,
-// km, totale, consegnato, ritirato, pagato, note (opzionale)
 // ---------------------------------------------------------------
-
-// Crea nuovo ordine — supporta sia singolo che multipli materiali
 app.post("/ordini", async (req, res) => {
   const { cliente_id, materiali, data_consegna, data_ritiro, km, note } = req.body || {};
 
   try {
     if (Array.isArray(materiali) && materiali.length > 0) {
-      // Inserimento di più righe ordine (uno per materiale)
       const creati = [];
       for (const item of materiali) {
         const { materiale_id, quantita } = item;
 
-        // prezzo weekend del materiale
         const m = await client.query("SELECT prezzo_weekend FROM materiali WHERE id=$1", [materiale_id]);
         if (m.rows.length === 0) continue;
         const prezzoWeekend = m.rows[0].prezzo_weekend;
@@ -259,7 +262,6 @@ app.post("/ordini", async (req, res) => {
       }
       return res.json({ message: "Ordini creati", ordini: creati });
     } else {
-      // Inserimento singolo (compatibilità)
       const { materiale_id, quantita } = req.body || {};
       const m = await client.query("SELECT prezzo_weekend FROM materiali WHERE id=$1", [materiale_id]);
       if (m.rows.length === 0) return res.status(400).json({ message: "Materiale non valido" });
@@ -281,7 +283,6 @@ app.post("/ordini", async (req, res) => {
   }
 });
 
-// Lista ordini (con indirizzo_spedizione) — ordinati per data_consegna
 app.get("/ordini", async (_req, res) => {
   try {
     const sql = `
@@ -314,7 +315,6 @@ app.get("/ordini", async (_req, res) => {
   }
 });
 
-// Modifica ordine (ri-calcola il totale)
 app.put("/ordini/:id", async (req, res) => {
   const { id } = req.params;
   const { cliente_id, materiale_id, quantita, data_consegna, data_ritiro, km, note } = req.body || {};
@@ -338,7 +338,6 @@ app.put("/ordini/:id", async (req, res) => {
   }
 });
 
-// Aggiorna SOLO lo stato (usato dal Calendario)
 app.patch("/ordini/:id/stato", async (req, res) => {
   const { id } = req.params;
   const { consegnato, ritirato, pagato } = req.body || {};
@@ -354,7 +353,6 @@ app.patch("/ordini/:id/stato", async (req, res) => {
   }
 });
 
-// Elimina ordine
 app.delete("/ordini/:id", async (req, res) => {
   const { id } = req.params;
   try {
@@ -381,7 +379,6 @@ app.get("/profitti/mensili", async (_req, res) => {
       ORDER BY 1 ASC;
     `;
     const r = await client.query(sql);
-    // Normalizza i numeri
     res.json(
       r.rows.map((row) => ({
         anno_mese: row.anno_mese,
@@ -395,7 +392,6 @@ app.get("/profitti/mensili", async (_req, res) => {
   }
 });
 
-// (facoltativo) Statistiche: numero ordini per materiale complessivo
 app.get("/statistiche/materiali", async (_req, res) => {
   try {
     const sql = `
@@ -428,5 +424,6 @@ app.get("/", (_req, res) => {
 // ---------------------------------------------------------------
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log(`✅ Backend attivo su http://localhost:${PORT}`);
+  console.log(`✅ Backend attivo su porta ${PORT}`);
 });
+
