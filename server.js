@@ -23,7 +23,15 @@ const client = new Client({
 
 await client.connect();
 
-app.use(cors());
+app.use(cors({
+  origin: [
+    "https://noleggio-cantinota-frontend.onrender.com",
+    "http://localhost:5173"
+  ],
+  methods: ["GET", "POST", "PUT", "DELETE", "PATCH"],
+  credentials: true
+}));
+
 app.use(bodyParser.json());
 
 // ---------------------------------------------------------------
