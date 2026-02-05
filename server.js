@@ -18,7 +18,7 @@ const DATABASE_URL = process.env.DATABASE_URL;
 
 // (Facoltativo ma utile per debug su Render)
 if (!DATABASE_URL) {
-  console.error(DATABASE_URL);
+  console.error(DATABASE_URL); //DA TOGLIERE
   console.error("❌ DATABASE_URL non è impostata nelle Environment Variables di Render");
 }
 
