@@ -1,69 +1,26 @@
-// server.js — Backend completo Noleggio Cantinota (ESM, Node 20)
-// ---------------------------------------------------------------
-
+// server.js — Backend Noleggio Cantinota (ESM, Node 20)
 import express from "express";
 import bodyParser from "body-parser";
 import cors from "cors";
 import pkg from "pg";
 const { Client } = pkg;
 import jwt from "jsonwebtoken";
+import bcrypt from "bcrypt";
+
+const SECRET_KEY = "chiave_super_segretissima";
 
 const app = express();
 
-// ---------------------------------------------------------------
-// ✅ Config da Render Environment
-// ---------------------------------------------------------------
-const SECRET_KEY = process.env.SECRET_KEY || "chiave_super_segretissima";
-const DATABASE_URL = process.env.DATABASE_URL;
-
-// (Facoltativo ma utile per debug su Render)
-if (!DATABASE_URL) {
-  console.error("❌ DATABASE_URL non è impostata nelle Environment Variables di Render");
-}
-
-// ---------------------------------------------------------------
-// ✅ CORS + Preflight (risolve il 'preflight' rosso nel browser)
-// ---------------------------------------------------------------
-const ALLOWED_ORIGINS = [
-  "https://noleggio-cantinota-frontend.onrender.com",
-  "http://localhost:5173",
-];
-
-const corsOptions = {
-  origin(origin, callback) {
-    // Permette richieste senza Origin (es. Postman) e quelle della whitelist
-    if (!origin) return callback(null, true);
-    if (ALLOWED_ORIGINS.includes(origin)) return callback(null, true);
-    return callback(new Error(`CORS blocked for origin: ${origin}`));
-  },
-  methods: ["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"],
-  allowedHeaders: ["Content-Type", "Authorization"],
-  credentials: true,
-  optionsSuccessStatus: 204,
-};
-
-app.use(cors(corsOptions));
-// ✅ gestione preflight per tutte le route
-app.options("*", cors(corsOptions));
-
-// ---------------------------------------------------------------
-// Middleware
-// ---------------------------------------------------------------
-app.use(bodyParser.json());
-
-// ---------------------------------------------------------------
-// 🔗 Connessione DB (Neon)
-// ---------------------------------------------------------------
 const client = new Client({
-  connectionString: DATABASE_URL,
-  ssl: { rejectUnauthorized: true },
+  connectionString:
+    "postgresql://neondb_owner:npg_JalrUR40VGyb@ep-spring-tooth-agl53mlo-pooler.c-2.eu-central-1.aws.neon.tech/neondb?sslmode=require",
+  ssl: { rejectUnauthorized: false },
 });
 
-// ✅ NON bloccare l’avvio del server (così non crasha su Render)
-client
-  .connect()
-  .then(() => console.log("✅ DB connesso"))
-  .catch((err) => console.error("❌ Errore connessione DB:", err.message));
+await client.connect();
+
+app.use(cors());
+app.use(bodyParser.json());
 
 // ---------------------------------------------------------------
 // Utilità
@@ -73,46 +30,101 @@ function euro(n) {
   return isFinite(v) ? v : 0;
 }
 
-function calcolaTotale(prezzoWeekend, quantita, km) {
-  const base = euro(prezzoWeekend) * Number(quantita || 0);
-  const extraKm = Math.max(0, Number(km || 0) - 50) * 3;
-  return base + extraKm;
+function toUTCDateOnly(yyyy_mm_dd) {
+  const [y, m, d] = String(yyyy_mm_dd).split("-").map(Number);
+  return new Date(Date.UTC(y, (m || 1) - 1, d || 1));
+}
+
+// conta quanti sabati ci sono tra start e end (inclusi)
+function countSaturdaysInclusive(startStr, endStr) {
+  const start = toUTCDateOnly(startStr);
+  const end = toUTCDateOnly(endStr);
+
+  if (isNaN(start) || isNaN(end)) return 1;
+  if (end < start) return 1;
+
+  let count = 0;
+  const cur = new Date(start);
+
+  while (cur <= end) {
+    if (cur.getUTCDay() === 6) count++; // 6 = sabato
+    cur.setUTCDate(cur.getUTCDate() + 1);
+  }
+
+  return count;
+}
+
+function weekendMultiplier(data_consegna, data_ritiro) {
+  // minimo 1 weekend SEMPRE
+  return Math.max(1, countSaturdaysInclusive(data_consegna, data_ritiro));
 }
 
 // ---------------------------------------------------------------
-// Healthcheck
+// AUTH middleware
 // ---------------------------------------------------------------
-app.get("/", (_req, res) => {
-  res.send("✅ Noleggio Cantinota backend attivo");
-});
+function authRequired(req, res, next) {
+  const auth = req.headers.authorization || "";
+  const token = auth.startsWith("Bearer ") ? auth.slice(7) : null;
+
+  if (!token) return res.status(401).json({ message: "Token mancante" });
+
+  try {
+    const payload = jwt.verify(token, SECRET_KEY);
+    req.user = payload; // { id, username, role }
+    next();
+  } catch (_e) {
+    return res.status(401).json({ message: "Token non valido" });
+  }
+}
+
+function adminOnly(req, res, next) {
+  if (req.user?.role !== "admin") return res.status(403).json({ message: "Permesso negato" });
+  next();
+}
 
 // ---------------------------------------------------------------
-// LOGIN (tabella admin con username/password in chiaro)
+// LOGIN (multiutente su tabella admin: password_hash + role)
+// Supporta anche vecchia password in chiaro se presente.
 // ---------------------------------------------------------------
 app.post("/login", async (req, res) => {
   const { username, password } = req.body || {};
   try {
     const r = await client.query(
-      "SELECT id, username FROM admin WHERE username = $1 AND password = $2",
-      [username, password]
+      "SELECT id, username, role, password, password_hash FROM admin WHERE username = $1 LIMIT 1",
+      [username]
     );
 
-    if (r.rows.length === 0) {
-      return res.status(401).json({ message: "Credenziali non valide" });
+    if (r.rows.length === 0) return res.status(401).json({ message: "Credenziali non valide" });
+
+    const u = r.rows[0];
+
+    let ok = false;
+    if (u.password_hash) {
+      ok = await bcrypt.compare(password || "", u.password_hash);
+    } else {
+      ok = (u.password || "") === (password || "");
     }
 
+    if (!ok) return res.status(401).json({ message: "Credenziali non valide" });
+
     const token = jwt.sign(
-      { id: r.rows[0].id, username: r.rows[0].username },
+      { id: u.id, username: u.username, role: u.role || "admin" },
       SECRET_KEY,
-      { expiresIn: "4h" }
+      { expiresIn: "8h" }
     );
 
-    res.json({ token });
+    res.json({ token, role: u.role || "admin", username: u.username });
   } catch (err) {
     console.error("Errore login:", err);
     res.status(500).json({ message: "Errore durante il login" });
   }
 });
+
+// health (pubblico)
+app.get("/", (_req, res) => res.send("✅ Noleggio Cantinota backend attivo"));
+
+// Da qui in poi: tutto protetto
+app.use(authRequired);
 
 // ---------------------------------------------------------------
 // CLIENTI
@@ -129,7 +141,7 @@ app.get("/clienti", async (_req, res) => {
   }
 });
 
-app.post("/clienti/add", async (req, res) => {
+app.post("/clienti/add", adminOnly, async (req, res) => {
   const { nome, indirizzo_spedizione, telefono } = req.body || {};
   try {
     const r = await client.query(
@@ -143,7 +155,7 @@ app.post("/clienti/add", async (req, res) => {
   }
 });
 
-app.put("/clienti/:id", async (req, res) => {
+app.put("/clienti/:id", adminOnly, async (req, res) => {
   const { id } = req.params;
   const { nome, indirizzo_spedizione, telefono } = req.body || {};
   try {
@@ -158,16 +170,12 @@ app.put("/clienti/:id", async (req, res) => {
   }
 });
 
-app.delete("/clienti/:id", async (req, res) => {
+app.delete("/clienti/:id", adminOnly, async (req, res) => {
   const { id } = req.params;
   try {
-    const ord = await client.query(
-      "SELECT 1 FROM ordini WHERE cliente_id=$1 LIMIT 1",
-      [id]
-    );
-    if (ord.rows.length > 0) {
-      return res.status(400).json({ message: "Cliente con ordini: non eliminabile" });
-    }
+    const ord = await client.query("SELECT 1 FROM ordini WHERE cliente_id=$1 LIMIT 1", [id]);
+    if (ord.rows.length > 0) return res.status(400).json({ message: "Cliente con ordini: non eliminabile" });
+
     await client.query("DELETE FROM clienti WHERE id=$1", [id]);
     res.json({ message: "Cliente eliminato" });
   } catch (err) {
@@ -179,11 +187,15 @@ app.delete("/clienti/:id", async (req, res) => {
 // ---------------------------------------------------------------
 // MATERIALI
 // ---------------------------------------------------------------
-app.get("/materiali", async (_req, res) => {
+app.get("/materiali", async (req, res) => {
   try {
-    const r = await client.query(
-      "SELECT id, nome, quantita_disponibile, prezzo_weekend FROM materiali ORDER BY nome ASC"
-    );
+    const isOperatore = req.user?.role === "operatore";
+
+    const sql = isOperatore
+      ? "SELECT id, nome, quantita_disponibile, NULL::numeric AS prezzo_weekend FROM materiali ORDER BY nome ASC"
+      : "SELECT id, nome, quantita_disponibile, prezzo_weekend FROM materiali ORDER BY nome ASC";
+
+    const r = await client.query(sql);
     res.json(r.rows);
   } catch (err) {
     console.error("Errore get materiali:", err);
@@ -191,7 +203,7 @@ app.get("/materiali", async (_req, res) => {
   }
 });
 
-app.post("/materiali", async (req, res) => {
+app.post("/materiali", adminOnly, async (req, res) => {
   const { nome, quantita_disponibile, prezzo_weekend } = req.body || {};
   try {
     const r = await client.query(
@@ -205,7 +217,7 @@ app.post("/materiali", async (req, res) => {
   }
 });
 
-app.put("/materiali/:id", async (req, res) => {
+app.put("/materiali/:id", adminOnly, async (req, res) => {
   const { id } = req.params;
   const { nome, quantita_disponibile, prezzo_weekend } = req.body || {};
   try {
@@ -220,16 +232,12 @@ app.put("/materiali/:id", async (req, res) => {
   }
 });
 
-app.delete("/materiali/:id", async (req, res) => {
+app.delete("/materiali/:id", adminOnly, async (req, res) => {
   const { id } = req.params;
   try {
-    const ord = await client.query(
-      "SELECT 1 FROM ordini WHERE materiale_id=$1 LIMIT 1",
-      [id]
-    );
-    if (ord.rows.length > 0) {
-      return res.status(400).json({ message: "Materiale usato in ordini: non eliminabile" });
-    }
+    const ord = await client.query("SELECT 1 FROM ordini_materiali WHERE materiale_id=$1 LIMIT 1", [id]);
+    if (ord.rows.length > 0) return res.status(400).json({ message: "Materiale usato in ordini: non eliminabile" });
+
     await client.query("DELETE FROM materiali WHERE id=$1", [id]);
     res.json({ message: "Materiale eliminato" });
   } catch (err) {
@@ -238,7 +246,7 @@ app.delete("/materiali/:id", async (req, res) => {
   }
 });
 
-// Disponibilità/occupazione per ogni materiale (ordini non ritirati)
+// Disponibilità (scala SOLO se consegnato=true e ritirato=false)
 app.get("/materiali/disponibilita", async (_req, res) => {
   try {
     const sql = `
@@ -246,21 +254,39 @@ app.get("/materiali/disponibilita", async (_req, res) => {
         m.id,
         m.nome,
         m.quantita_disponibile AS stock_totale,
-        COALESCE(SUM(CASE WHEN o.ritirato = false THEN o.quantita ELSE 0 END), 0) AS occupati,
-        m.quantita_disponibile - COALESCE(SUM(CASE WHEN o.ritirato = false THEN o.quantita ELSE 0 END), 0) AS disponibili
+        COALESCE(
+          SUM(
+            CASE
+              WHEN o.consegnato = true AND o.ritirato = false
+              THEN om.quantita
+              ELSE 0
+            END
+          ), 0
+        ) AS occupati
       FROM materiali m
-      LEFT JOIN ordini o ON o.materiale_id = m.id
+      LEFT JOIN ordini_materiali om ON om.materiale_id = m.id
+      LEFT JOIN ordini o ON o.id = om.ordine_id
       GROUP BY m.id, m.nome, m.quantita_disponibile
       ORDER BY m.nome ASC;
     `;
+
     const r = await client.query(sql);
+
     res.json(
-      r.rows.map((row) => ({
-        ...row,
-        low_stock:
-          Number(row.disponibili) <=
-          Math.max(1, Math.floor(Number(row.stock_totale) * 0.1)),
-      }))
+      r.rows.map((row) => {
+        const stock = Number(row.stock_totale || 0);
+        const occupati = Number(row.occupati || 0);
+        const disponibili = stock - occupati;
+
+        return {
+          id: row.id,
+          nome: row.nome,
+          stock_totale: stock,
+          occupati,
+          disponibili,
+          low_stock: disponibili <= Math.max(1, Math.floor(stock * 0.1)),
+        };
+      })
     );
   } catch (err) {
     console.error("Errore disponibilità materiali:", err);
@@ -269,112 +295,168 @@ app.get("/materiali/disponibilita", async (_req, res) => {
 });
 
 // ---------------------------------------------------------------
-// ORDINI
+// ORDINI (ordine unico + righe materiali)
 // ---------------------------------------------------------------
-app.post("/ordini", async (req, res) => {
+app.post("/ordini", adminOnly, async (req, res) => {
   const { cliente_id, materiali, data_consegna, data_ritiro, km, note } = req.body || {};
 
   try {
-    if (Array.isArray(materiali) && materiali.length > 0) {
-      const creati = [];
-      for (const item of materiali) {
-        const { materiale_id, quantita } = item;
+    if (!cliente_id || !data_consegna || !data_ritiro || !Array.isArray(materiali) || materiali.length === 0) {
+      return res.status(400).json({ message: "Dati ordine non validi" });
+    }
 
-        const m = await client.query("SELECT prezzo_weekend FROM materiali WHERE id=$1", [
-          materiale_id,
-        ]);
-        if (m.rows.length === 0) continue;
+    const extraKm = Number(km || 0) * 3;
 
-        const prezzoWeekend = m.rows[0].prezzo_weekend;
-        const totale = calcolaTotale(prezzoWeekend, quantita, km);
+    // ✅ numero weekend toccati (min 1, raddoppia se tocca 2 sabati, ecc.)
+    const w = weekendMultiplier(data_consegna, data_ritiro);
 
-        const ins = await client.query(
-          `INSERT INTO ordini
-           (cliente_id, materiale_id, quantita, data_consegna, data_ritiro, km, totale, consegnato, ritirato, pagato, note)
-           VALUES ($1,$2,$3,$4,$5,$6,$7,false,false,false,$8)
-           RETURNING *`,
-          [cliente_id, materiale_id, quantita, data_consegna, data_ritiro, km, totale, note || null]
-        );
-        creati.push(ins.rows[0]);
-      }
-      return res.json({ message: "Ordini creati", ordini: creati });
-    } else {
-      const { materiale_id, quantita } = req.body || {};
+    let base = 0;
+    for (const item of materiali) {
+      const materiale_id = Number(item.materiale_id);
+      const quantita = Number(item.quantita);
+      if (!materiale_id || !quantita) continue;
 
-      const m = await client.query("SELECT prezzo_weekend FROM materiali WHERE id=$1", [
-        materiale_id,
-      ]);
+      const m = await client.query("SELECT prezzo_weekend FROM materiali WHERE id=$1", [materiale_id]);
       if (m.rows.length === 0) return res.status(400).json({ message: "Materiale non valido" });
 
-      const prezzoWeekend = m.rows[0].prezzo_weekend;
-      const totale = calcolaTotale(prezzoWeekend, quantita, km);
-
-      const ins = await client.query(
-        `INSERT INTO ordini
-         (cliente_id, materiale_id, quantita, data_consegna, data_ritiro, km, totale, consegnato, ritirato, pagato, note)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,false,false,false,$8)
-         RETURNING *`,
-        [cliente_id, materiale_id, quantita, data_consegna, data_ritiro, km, totale, note || null]
-      );
-      return res.json(ins.rows[0]);
+      base += euro(m.rows[0].prezzo_weekend) * quantita;
     }
+
+    // ✅ applico moltiplicatore weekend
+    const totale = (base * w) + extraKm;
+
+    const insOrd = await client.query(
+      `INSERT INTO ordini (cliente_id, data_consegna, data_ritiro, km, totale, consegnato, ritirato, pagato, note)
+       VALUES ($1,$2,$3,$4,$5,false,false,false,$6)
+       RETURNING *`,
+      [Number(cliente_id), data_consegna, data_ritiro, Number(km || 0), totale, note || null]
+    );
+
+    const ordine = insOrd.rows[0];
+
+    for (const item of materiali) {
+      const materiale_id = Number(item.materiale_id);
+      const quantita = Number(item.quantita);
+      if (!materiale_id || !quantita) continue;
+
+      await client.query(
+        `INSERT INTO ordini_materiali (ordine_id, materiale_id, quantita)
+         VALUES ($1,$2,$3)`,
+        [ordine.id, materiale_id, quantita]
+      );
+    }
+
+    res.json({ message: "Ordine creato", ordine_id: ordine.id });
   } catch (err) {
     console.error("Errore nella creazione ordine:", err);
     res.status(500).send("Errore nella creazione dell'ordine");
   }
 });
 
-app.get("/ordini", async (_req, res) => {
+app.get("/ordini", async (req, res) => {
   try {
+    const isOperatore = req.user?.role === "operatore";
+
     const sql = `
       SELECT
         o.id,
         o.cliente_id,
-        o.materiale_id,
         c.nome AS cliente,
         c.indirizzo_spedizione,
-        m.nome AS materiale,
-        o.quantita,
+        o.data_consegna,
+        o.data_ritiro,
         o.km,
-        o.totale,
+        ${isOperatore ? "NULL::numeric AS totale" : "o.totale"} ,
         o.consegnato,
         o.ritirato,
         o.pagato,
         o.note,
-        o.data_consegna,
-        o.data_ritiro
+        COALESCE(
+          json_agg(
+            json_build_object(
+              'materiale_id', om.materiale_id,
+              'materiale', m.nome,
+              'quantita', om.quantita
+            )
+          ) FILTER (WHERE om.id IS NOT NULL),
+          '[]'::json
+        ) AS materiali
       FROM ordini o
       JOIN clienti c ON c.id = o.cliente_id
-      JOIN materiali m ON m.id = o.materiale_id
+      LEFT JOIN ordini_materiali om ON om.ordine_id = o.id
+      LEFT JOIN materiali m ON m.id = om.materiale_id
+      GROUP BY o.id, c.nome, c.indirizzo_spedizione
       ORDER BY o.data_consegna DESC, o.id DESC;
     `;
+
     const r = await client.query(sql);
-    res.json(r.rows);
+
+    const out = r.rows.map((o) => {
+      let stato = "DA CONSEGNARE";
+      if (o.pagato) stato = "PAGATO";
+      else if (o.ritirato) stato = "RITIRATO";
+      else if (o.consegnato) stato = "CONSEGNATO";
+      return { ...o, stato };
+    });
+
+    res.json(out);
   } catch (err) {
     console.error("Errore get ordini:", err);
     res.status(500).send("Errore nel recupero degli ordini");
   }
 });
 
-app.put("/ordini/:id", async (req, res) => {
+app.put("/ordini/:id", adminOnly, async (req, res) => {
   const { id } = req.params;
-  const { cliente_id, materiale_id, quantita, data_consegna, data_ritiro, km, note } = req.body || {};
-  try {
-    const m = await client.query("SELECT prezzo_weekend FROM materiali WHERE id=$1", [
-      materiale_id,
-    ]);
-    if (m.rows.length === 0) return res.status(400).json({ message: "Materiale non valido" });
+  const { cliente_id, materiali, data_consegna, data_ritiro, km, note } = req.body || {};
 
-    const prezzoWeekend = m.rows[0].prezzo_weekend;
-    const totale = calcolaTotale(prezzoWeekend, quantita, km);
+  try {
+    if (!cliente_id || !data_consegna || !data_ritiro || !Array.isArray(materiali) || materiali.length === 0) {
+      return res.status(400).json({ message: "Dati ordine non validi" });
+    }
+
+    const extraKm = Number(km || 0) * 3;
+
+    // ✅ numero weekend toccati
+    const w = weekendMultiplier(data_consegna, data_ritiro);
+
+    let base = 0;
+
+    for (const item of materiali) {
+      const materiale_id = Number(item.materiale_id);
+      const quantita = Number(item.quantita);
+      if (!materiale_id || !quantita) continue;
+
+      const m = await client.query("SELECT prezzo_weekend FROM materiali WHERE id=$1", [materiale_id]);
+      if (m.rows.length === 0) return res.status(400).json({ message: "Materiale non valido" });
+
+      base += euro(m.rows[0].prezzo_weekend) * quantita;
+    }
+
+    // ✅ applico moltiplicatore weekend
+    const totale = (base * w) + extraKm;
 
     const up = await client.query(
       `UPDATE ordini
-       SET cliente_id=$1, materiale_id=$2, quantita=$3, data_consegna=$4, data_ritiro=$5, km=$6, totale=$7, note=$8
-       WHERE id=$9
+       SET cliente_id=$1, data_consegna=$2, data_ritiro=$3, km=$4, totale=$5, note=$6
+       WHERE id=$7
        RETURNING *`,
-      [cliente_id, materiale_id, quantita, data_consegna, data_ritiro, km, totale, note || null, id]
+      [Number(cliente_id), data_consegna, data_ritiro, Number(km || 0), totale, note || null, Number(id)]
     );
+
+    await client.query("DELETE FROM ordini_materiali WHERE ordine_id=$1", [Number(id)]);
+    for (const item of materiali) {
+      const materiale_id = Number(item.materiale_id);
+      const quantita = Number(item.quantita);
+      if (!materiale_id || !quantita) continue;
+
+      await client.query(
+        `INSERT INTO ordini_materiali (ordine_id, materiale_id, quantita)
+         VALUES ($1,$2,$3)`,
+        [Number(id), materiale_id, quantita]
+      );
+    }
+
     res.json(up.rows[0]);
   } catch (err) {
     console.error("Errore update ordine:", err);
@@ -382,13 +464,13 @@ app.put("/ordini/:id", async (req, res) => {
   }
 });
 
-app.patch("/ordini/:id/stato", async (req, res) => {
+app.patch("/ordini/:id/stato", adminOnly, async (req, res) => {
   const { id } = req.params;
   const { consegnato, ritirato, pagato } = req.body || {};
   try {
     const up = await client.query(
       "UPDATE ordini SET consegnato=$1, ritirato=$2, pagato=$3 WHERE id=$4 RETURNING *",
-      [!!consegnato, !!ritirato, !!pagato, id]
+      [!!consegnato, !!ritirato, !!pagato, Number(id)]
     );
     res.json(up.rows[0]);
   } catch (err) {
@@ -397,10 +479,10 @@ app.patch("/ordini/:id/stato", async (req, res) => {
   }
 });
 
-app.delete("/ordini/:id", async (req, res) => {
+app.delete("/ordini/:id", adminOnly, async (req, res) => {
   const { id } = req.params;
   try {
-    await client.query("DELETE FROM ordini WHERE id=$1", [id]);
+    await client.query("DELETE FROM ordini WHERE id=$1", [Number(id)]);
     res.json({ message: "Ordine eliminato" });
   } catch (err) {
     console.error("Errore delete ordine:", err);
@@ -409,39 +491,42 @@ app.delete("/ordini/:id", async (req, res) => {
 });
 
 // ---------------------------------------------------------------
-// PROFITTI (solo ordini pagati)
+// PROFITTI (solo admin)
 // ---------------------------------------------------------------
-app.get("/profitti/mensili", async (_req, res) => {
+app.get("/profitti/mensili", adminOnly, async (_req, res) => {
   try {
     const sql = `
       SELECT
         TO_CHAR(date_trunc('month', data_consegna), 'YYYY-MM') AS anno_mese,
-        TO_CHAR(date_trunc('month', data_consegna), 'TMMonth', 'it_IT') AS mese_nome,
-        SUM(CASE WHEN pagato = true THEN COALESCE(totale,0) ELSE 0 END) AS totale_pagato
+        SUM(CASE WHEN pagato = true THEN COALESCE(totale, 0) ELSE 0 END) AS totale_pagato
       FROM ordini
-      GROUP BY 1,2
+      GROUP BY 1
       ORDER BY 1 ASC;
     `;
+
     const r = await client.query(sql);
+
     res.json(
       r.rows.map((row) => ({
         anno_mese: row.anno_mese,
-        mese: row.mese_nome?.trim() || row.anno_mese,
         totale_pagato: euro(row.totale_pagato),
       }))
     );
   } catch (err) {
     console.error("Errore profitti mensili:", err);
-    res.status(500).send("Errore nel calcolo profitti");
+    res.status(500).json({ message: "Errore nel calcolo profitti" });
   }
 });
 
+// ---------------------------------------------------------------
+// Statistiche (corrette col nuovo schema ordini_materiali)
+// ---------------------------------------------------------------
 app.get("/statistiche/materiali", async (_req, res) => {
   try {
     const sql = `
-      SELECT m.nome, COUNT(o.id) AS numero_ordini
+      SELECT m.nome, COALESCE(SUM(om.quantita),0) AS numero_ordini
       FROM materiali m
-      LEFT JOIN ordini o ON o.materiale_id = m.id
+      LEFT JOIN ordini_materiali om ON om.materiale_id = m.id
       GROUP BY m.nome
       ORDER BY numero_ordini DESC;
     `;
@@ -458,8 +543,5 @@ app.get("/statistiche/materiali", async (_req, res) => {
   }
 });
 
-// ---------------------------------------------------------------
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-  console.log(`✅ Backend attivo su porta ${PORT}`);
-});
+app.listen(PORT, () => console.log(`✅ Backend attivo su http://localhost:${PORT}`));
