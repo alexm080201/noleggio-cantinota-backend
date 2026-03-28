@@ -7,19 +7,26 @@ const { Client } = pkg;
 import jwt from "jsonwebtoken";
 import bcrypt from "bcrypt";
 
-const SECRET_KEY = "chiave_super_segretissima";
+const SECRET_KEY = process.env.SECRET_KEY;
 
 const app = express();
 
 const client = new Client({
-  connectionString:
-    "postgresql://neondb_owner:npg_JalrUR40VGyb@ep-spring-tooth-agl53mlo-pooler.c-2.eu-central-1.aws.neon.tech/neondb?sslmode=require",
+  connectionString: process.env.DATABASE_URL,
   ssl: { rejectUnauthorized: false },
 });
 
 await client.connect();
 
-app.use(cors());
+app.use(
+  cors({
+    origin: [
+      "http://localhost:5173",
+      process.env.FRONTEND_URL,
+    ].filter(Boolean),
+  })
+);
+
 app.use(bodyParser.json());
 
 // ---------------------------------------------------------------
@@ -55,7 +62,6 @@ function countSaturdaysInclusive(startStr, endStr) {
 }
 
 function weekendMultiplier(data_consegna, data_ritiro) {
-  // minimo 1 weekend SEMPRE
   return Math.max(1, countSaturdaysInclusive(data_consegna, data_ritiro));
 }
 
@@ -78,7 +84,9 @@ function authRequired(req, res, next) {
 }
 
 function adminOnly(req, res, next) {
-  if (req.user?.role !== "admin") return res.status(403).json({ message: "Permesso negato" });
+  if (req.user?.role !== "admin") {
+    return res.status(403).json({ message: "Permesso negato" });
+  }
   next();
 }
 
@@ -88,13 +96,16 @@ function adminOnly(req, res, next) {
 // ---------------------------------------------------------------
 app.post("/login", async (req, res) => {
   const { username, password } = req.body || {};
+
   try {
     const r = await client.query(
       "SELECT id, username, role, password, password_hash FROM admin WHERE username = $1 LIMIT 1",
       [username]
     );
 
-    if (r.rows.length === 0) return res.status(401).json({ message: "Credenziali non valide" });
+    if (r.rows.length === 0) {
+      return res.status(401).json({ message: "Credenziali non valide" });
+    }
 
     const u = r.rows[0];
 
@@ -105,7 +116,9 @@ app.post("/login", async (req, res) => {
       ok = (u.password || "") === (password || "");
     }
 
-    if (!ok) return res.status(401).json({ message: "Credenziali non valide" });
+    if (!ok) {
+      return res.status(401).json({ message: "Credenziali non valide" });
+    }
 
     const token = jwt.sign(
       { id: u.id, username: u.username, role: u.role || "admin" },
@@ -113,7 +126,11 @@ app.post("/login", async (req, res) => {
       { expiresIn: "8h" }
     );
 
-    res.json({ token, role: u.role || "admin", username: u.username });
+    res.json({
+      token,
+      role: u.role || "admin",
+      username: u.username,
+    });
   } catch (err) {
     console.error("Errore login:", err);
     res.status(500).json({ message: "Errore durante il login" });
@@ -121,7 +138,9 @@ app.post("/login", async (req, res) => {
 });
 
 // health (pubblico)
-app.get("/", (_req, res) => res.send("✅ Noleggio Cantinota backend attivo"));
+app.get("/", (_req, res) => {
+  res.send("✅ Noleggio Cantinota backend attivo");
+});
 
 // Da qui in poi: tutto protetto
 app.use(authRequired);
@@ -143,6 +162,7 @@ app.get("/clienti", async (_req, res) => {
 
 app.post("/clienti/add", adminOnly, async (req, res) => {
   const { nome, indirizzo_spedizione, telefono } = req.body || {};
+
   try {
     const r = await client.query(
       "INSERT INTO clienti (nome, indirizzo_spedizione, telefono) VALUES ($1,$2,$3) RETURNING *",
@@ -158,6 +178,7 @@ app.post("/clienti/add", adminOnly, async (req, res) => {
 app.put("/clienti/:id", adminOnly, async (req, res) => {
   const { id } = req.params;
   const { nome, indirizzo_spedizione, telefono } = req.body || {};
+
   try {
     const r = await client.query(
       "UPDATE clienti SET nome=$1, indirizzo_spedizione=$2, telefono=$3 WHERE id=$4 RETURNING *",
@@ -172,9 +193,18 @@ app.put("/clienti/:id", adminOnly, async (req, res) => {
 
 app.delete("/clienti/:id", adminOnly, async (req, res) => {
   const { id } = req.params;
+
   try {
-    const ord = await client.query("SELECT 1 FROM ordini WHERE cliente_id=$1 LIMIT 1", [id]);
-    if (ord.rows.length > 0) return res.status(400).json({ message: "Cliente con ordini: non eliminabile" });
+    const ord = await client.query(
+      "SELECT 1 FROM ordini WHERE cliente_id=$1 LIMIT 1",
+      [id]
+    );
+
+    if (ord.rows.length > 0) {
+      return res
+        .status(400)
+        .json({ message: "Cliente con ordini: non eliminabile" });
+    }
 
     await client.query("DELETE FROM clienti WHERE id=$1", [id]);
     res.json({ message: "Cliente eliminato" });
@@ -205,6 +235,7 @@ app.get("/materiali", async (req, res) => {
 
 app.post("/materiali", adminOnly, async (req, res) => {
   const { nome, quantita_disponibile, prezzo_weekend } = req.body || {};
+
   try {
     const r = await client.query(
       "INSERT INTO materiali (nome, quantita_disponibile, prezzo_weekend) VALUES ($1,$2,$3) RETURNING *",
@@ -220,6 +251,7 @@ app.post("/materiali", adminOnly, async (req, res) => {
 app.put("/materiali/:id", adminOnly, async (req, res) => {
   const { id } = req.params;
   const { nome, quantita_disponibile, prezzo_weekend } = req.body || {};
+
   try {
     const r = await client.query(
       "UPDATE materiali SET nome=$1, quantita_disponibile=$2, prezzo_weekend=$3 WHERE id=$4 RETURNING *",
@@ -234,9 +266,18 @@ app.put("/materiali/:id", adminOnly, async (req, res) => {
 
 app.delete("/materiali/:id", adminOnly, async (req, res) => {
   const { id } = req.params;
+
   try {
-    const ord = await client.query("SELECT 1 FROM ordini_materiali WHERE materiale_id=$1 LIMIT 1", [id]);
-    if (ord.rows.length > 0) return res.status(400).json({ message: "Materiale usato in ordini: non eliminabile" });
+    const ord = await client.query(
+      "SELECT 1 FROM ordini_materiali WHERE materiale_id=$1 LIMIT 1",
+      [id]
+    );
+
+    if (ord.rows.length > 0) {
+      return res
+        .status(400)
+        .json({ message: "Materiale usato in ordini: non eliminabile" });
+    }
 
     await client.query("DELETE FROM materiali WHERE id=$1", [id]);
     res.json({ message: "Materiale eliminato" });
@@ -298,16 +339,27 @@ app.get("/materiali/disponibilita", async (_req, res) => {
 // ORDINI (ordine unico + righe materiali)
 // ---------------------------------------------------------------
 app.post("/ordini", adminOnly, async (req, res) => {
-  const { cliente_id, materiali, data_consegna, data_ritiro, km, note } = req.body || {};
+  const {
+    cliente_id,
+    materiali,
+    data_consegna,
+    data_ritiro,
+    km,
+    note,
+  } = req.body || {};
 
   try {
-    if (!cliente_id || !data_consegna || !data_ritiro || !Array.isArray(materiali) || materiali.length === 0) {
+    if (
+      !cliente_id ||
+      !data_consegna ||
+      !data_ritiro ||
+      !Array.isArray(materiali) ||
+      materiali.length === 0
+    ) {
       return res.status(400).json({ message: "Dati ordine non validi" });
     }
 
     const extraKm = Number(km || 0) * 3;
-
-    // ✅ numero weekend toccati (min 1, raddoppia se tocca 2 sabati, ecc.)
     const w = weekendMultiplier(data_consegna, data_ritiro);
 
     let base = 0;
@@ -316,20 +368,32 @@ app.post("/ordini", adminOnly, async (req, res) => {
       const quantita = Number(item.quantita);
       if (!materiale_id || !quantita) continue;
 
-      const m = await client.query("SELECT prezzo_weekend FROM materiali WHERE id=$1", [materiale_id]);
-      if (m.rows.length === 0) return res.status(400).json({ message: "Materiale non valido" });
+      const m = await client.query(
+        "SELECT prezzo_weekend FROM materiali WHERE id=$1",
+        [materiale_id]
+      );
+
+      if (m.rows.length === 0) {
+        return res.status(400).json({ message: "Materiale non valido" });
+      }
 
       base += euro(m.rows[0].prezzo_weekend) * quantita;
     }
 
-    // ✅ applico moltiplicatore weekend
-    const totale = (base * w) + extraKm;
+    const totale = base * w + extraKm;
 
     const insOrd = await client.query(
       `INSERT INTO ordini (cliente_id, data_consegna, data_ritiro, km, totale, consegnato, ritirato, pagato, note)
        VALUES ($1,$2,$3,$4,$5,false,false,false,$6)
        RETURNING *`,
-      [Number(cliente_id), data_consegna, data_ritiro, Number(km || 0), totale, note || null]
+      [
+        Number(cliente_id),
+        data_consegna,
+        data_ritiro,
+        Number(km || 0),
+        totale,
+        note || null,
+      ]
     );
 
     const ordine = insOrd.rows[0];
@@ -366,7 +430,7 @@ app.get("/ordini", async (req, res) => {
         o.data_consegna,
         o.data_ritiro,
         o.km,
-        ${isOperatore ? "NULL::numeric AS totale" : "o.totale"} ,
+        ${isOperatore ? "NULL::numeric AS totale" : "o.totale"},
         o.consegnato,
         o.ritirato,
         o.pagato,
@@ -408,16 +472,27 @@ app.get("/ordini", async (req, res) => {
 
 app.put("/ordini/:id", adminOnly, async (req, res) => {
   const { id } = req.params;
-  const { cliente_id, materiali, data_consegna, data_ritiro, km, note } = req.body || {};
+  const {
+    cliente_id,
+    materiali,
+    data_consegna,
+    data_ritiro,
+    km,
+    note,
+  } = req.body || {};
 
   try {
-    if (!cliente_id || !data_consegna || !data_ritiro || !Array.isArray(materiali) || materiali.length === 0) {
+    if (
+      !cliente_id ||
+      !data_consegna ||
+      !data_ritiro ||
+      !Array.isArray(materiali) ||
+      materiali.length === 0
+    ) {
       return res.status(400).json({ message: "Dati ordine non validi" });
     }
 
     const extraKm = Number(km || 0) * 3;
-
-    // ✅ numero weekend toccati
     const w = weekendMultiplier(data_consegna, data_ritiro);
 
     let base = 0;
@@ -427,24 +502,40 @@ app.put("/ordini/:id", adminOnly, async (req, res) => {
       const quantita = Number(item.quantita);
       if (!materiale_id || !quantita) continue;
 
-      const m = await client.query("SELECT prezzo_weekend FROM materiali WHERE id=$1", [materiale_id]);
-      if (m.rows.length === 0) return res.status(400).json({ message: "Materiale non valido" });
+      const m = await client.query(
+        "SELECT prezzo_weekend FROM materiali WHERE id=$1",
+        [materiale_id]
+      );
+
+      if (m.rows.length === 0) {
+        return res.status(400).json({ message: "Materiale non valido" });
+      }
 
       base += euro(m.rows[0].prezzo_weekend) * quantita;
     }
 
-    // ✅ applico moltiplicatore weekend
-    const totale = (base * w) + extraKm;
+    const totale = base * w + extraKm;
 
     const up = await client.query(
       `UPDATE ordini
        SET cliente_id=$1, data_consegna=$2, data_ritiro=$3, km=$4, totale=$5, note=$6
        WHERE id=$7
        RETURNING *`,
-      [Number(cliente_id), data_consegna, data_ritiro, Number(km || 0), totale, note || null, Number(id)]
+      [
+        Number(cliente_id),
+        data_consegna,
+        data_ritiro,
+        Number(km || 0),
+        totale,
+        note || null,
+        Number(id),
+      ]
     );
 
-    await client.query("DELETE FROM ordini_materiali WHERE ordine_id=$1", [Number(id)]);
+    await client.query("DELETE FROM ordini_materiali WHERE ordine_id=$1", [
+      Number(id),
+    ]);
+
     for (const item of materiali) {
       const materiale_id = Number(item.materiale_id);
       const quantita = Number(item.quantita);
@@ -467,6 +558,7 @@ app.put("/ordini/:id", adminOnly, async (req, res) => {
 app.patch("/ordini/:id/stato", adminOnly, async (req, res) => {
   const { id } = req.params;
   const { consegnato, ritirato, pagato } = req.body || {};
+
   try {
     const up = await client.query(
       "UPDATE ordini SET consegnato=$1, ritirato=$2, pagato=$3 WHERE id=$4 RETURNING *",
@@ -481,6 +573,7 @@ app.patch("/ordini/:id/stato", adminOnly, async (req, res) => {
 
 app.delete("/ordini/:id", adminOnly, async (req, res) => {
   const { id } = req.params;
+
   try {
     await client.query("DELETE FROM ordini WHERE id=$1", [Number(id)]);
     res.json({ message: "Ordine eliminato" });
@@ -530,7 +623,9 @@ app.get("/statistiche/materiali", async (_req, res) => {
       GROUP BY m.nome
       ORDER BY numero_ordini DESC;
     `;
+
     const r = await client.query(sql);
+
     res.json(
       r.rows.map((row) => ({
         nome: row.nome,
@@ -544,4 +639,4 @@ app.get("/statistiche/materiali", async (_req, res) => {
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`✅ Backend attivo su http://localhost:${PORT}`));
+app.listen(PORT, () => console.log(`✅ Backend attivo sulla porta ${PORT}`));
