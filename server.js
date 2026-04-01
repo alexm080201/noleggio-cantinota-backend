@@ -287,7 +287,7 @@ app.delete("/materiali/:id", adminOnly, async (req, res) => {
   }
 });
 
-// Disponibilità (scala SOLO se consegnato=true e ritirato=false)
+// Disponibilità attuale (scala SOLO se consegnato=true e ritirato=false)
 app.get("/materiali/disponibilita", async (_req, res) => {
   try {
     const sql = `
@@ -332,6 +332,72 @@ app.get("/materiali/disponibilita", async (_req, res) => {
   } catch (err) {
     console.error("Errore disponibilità materiali:", err);
     res.status(500).send("Errore nel calcolo disponibilità");
+  }
+});
+
+// Disponibilità per periodo (basata SOLO sulle date, non sugli stati)
+app.get("/materiali/disponibilita-periodo", async (req, res) => {
+  const { dal, al } = req.query || {};
+
+  try {
+    if (!dal || !al) {
+      return res.status(400).json({
+        message: "Parametri mancanti: servono 'dal' e 'al'",
+      });
+    }
+
+    if (toUTCDateOnly(al) < toUTCDateOnly(dal)) {
+      return res.status(400).json({
+        message: "Intervallo non valido: la data finale è precedente a quella iniziale",
+      });
+    }
+
+    const sql = `
+      SELECT
+        m.id,
+        m.nome,
+        m.quantita_disponibile AS stock_totale,
+        COALESCE(
+          SUM(
+            CASE
+              WHEN o.data_consegna <= $2
+               AND o.data_ritiro >= $1
+              THEN om.quantita
+              ELSE 0
+            END
+          ),
+          0
+        ) AS prenotati
+      FROM materiali m
+      LEFT JOIN ordini_materiali om ON om.materiale_id = m.id
+      LEFT JOIN ordini o ON o.id = om.ordine_id
+      GROUP BY m.id, m.nome, m.quantita_disponibile
+      ORDER BY m.nome ASC;
+    `;
+
+    const r = await client.query(sql, [dal, al]);
+
+    res.json(
+      r.rows.map((row) => {
+        const stock = Number(row.stock_totale || 0);
+        const prenotati = Number(row.prenotati || 0);
+        const disponibili = stock - prenotati;
+
+        return {
+          id: row.id,
+          nome: row.nome,
+          stock_totale: stock,
+          prenotati,
+          disponibili,
+          low_stock: disponibili <= Math.max(1, Math.floor(stock * 0.1)),
+        };
+      })
+    );
+  } catch (err) {
+    console.error("Errore disponibilità periodo:", err);
+    res.status(500).json({
+      message: "Errore nel calcolo disponibilità per periodo",
+    });
   }
 });
 
