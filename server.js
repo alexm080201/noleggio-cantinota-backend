@@ -407,6 +407,7 @@ app.get("/materiali/disponibilita-periodo", async (req, res) => {
 app.post("/ordini", adminOnly, async (req, res) => {
   const {
     cliente_id,
+    numero_prenotazione,
     materiali,
     data_consegna,
     data_ritiro,
@@ -449,11 +450,23 @@ app.post("/ordini", adminOnly, async (req, res) => {
     const totale = base * w + extraKm;
 
     const insOrd = await client.query(
-      `INSERT INTO ordini (cliente_id, data_consegna, data_ritiro, km, totale, consegnato, ritirato, pagato, note)
-       VALUES ($1,$2,$3,$4,$5,false,false,false,$6)
+      `INSERT INTO ordini (
+        cliente_id,
+        numero_prenotazione,
+        data_consegna,
+        data_ritiro,
+        km,
+        totale,
+        consegnato,
+        ritirato,
+        pagato,
+        note
+      )
+       VALUES ($1,$2,$3,$4,$5,$6,false,false,false,$7)
        RETURNING *`,
       [
         Number(cliente_id),
+        numero_prenotazione || null,
         data_consegna,
         data_ritiro,
         Number(km || 0),
@@ -491,6 +504,7 @@ app.get("/ordini", async (req, res) => {
       SELECT
         o.id,
         o.cliente_id,
+        o.numero_prenotazione,
         c.nome AS cliente,
         c.indirizzo_spedizione,
         o.data_consegna,
@@ -516,7 +530,7 @@ app.get("/ordini", async (req, res) => {
       LEFT JOIN ordini_materiali om ON om.ordine_id = o.id
       LEFT JOIN materiali m ON m.id = om.materiale_id
       GROUP BY o.id, c.nome, c.indirizzo_spedizione
-      ORDER BY o.data_consegna DESC, o.id DESC;
+      ORDER BY o.data_consegna ASC, o.id ASC;
     `;
 
     const r = await client.query(sql);
@@ -540,6 +554,7 @@ app.put("/ordini/:id", adminOnly, async (req, res) => {
   const { id } = req.params;
   const {
     cliente_id,
+    numero_prenotazione,
     materiali,
     data_consegna,
     data_ritiro,
@@ -584,11 +599,18 @@ app.put("/ordini/:id", adminOnly, async (req, res) => {
 
     const up = await client.query(
       `UPDATE ordini
-       SET cliente_id=$1, data_consegna=$2, data_ritiro=$3, km=$4, totale=$5, note=$6
-       WHERE id=$7
+       SET cliente_id=$1,
+           numero_prenotazione=$2,
+           data_consegna=$3,
+           data_ritiro=$4,
+           km=$5,
+           totale=$6,
+           note=$7
+       WHERE id=$8
        RETURNING *`,
       [
         Number(cliente_id),
+        numero_prenotazione || null,
         data_consegna,
         data_ritiro,
         Number(km || 0),
